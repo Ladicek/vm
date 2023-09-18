@@ -1,0 +1,82 @@
+#!/bin/bash
+
+_list_vms() {
+    vboxmanage list vms | cut -d '"' -f 2
+}
+
+_list_running_vms() {
+    vboxmanage list runningvms | cut -d '"' -f 2
+}
+
+_vm_complete() {
+    compopt +o default
+
+    local cur_word="${COMP_WORDS[COMP_CWORD]}"
+    local prev_word="${COMP_WORDS[COMP_CWORD-1]}"
+    case ${COMP_CWORD} in
+        1)
+            COMPREPLY=($(compgen -W "version create start stop kill destroy list info ssh" -- $cur_word))
+            ;;
+        2)
+            case $prev_word in
+                version)
+                    COMPREPLY=()
+                    ;;
+                create)
+                    COMPREPLY=($(compgen -W "--name --distro --cpu --mem --cloud-init" -- $cur_word))
+                    ;;
+                start)
+                    COMPREPLY=($(compgen -W "$(_list_vms)" -- $cur_word))
+                    ;;
+                stop)
+                    COMPREPLY=($(compgen -W "$(_list_running_vms)" -- $cur_word))
+                    ;;
+                kill)
+                    COMPREPLY=($(compgen -W "$(_list_running_vms)" -- $cur_word))
+                    ;;
+                destroy)
+                    COMPREPLY=($(compgen -W "$(_list_vms)" -- $cur_word))
+                    ;;
+                list)
+                    COMPREPLY=($(compgen -W "--running" -- $cur_word))
+                    ;;
+                info)
+                    COMPREPLY=($(compgen -W "$(_list_vms)" -- $cur_word))
+                    ;;
+                ssh)
+                    COMPREPLY=($(compgen -W "$(_list_running_vms)" -- $cur_word))
+                    ;;
+            esac
+            ;;
+        *)
+            local cmd="${COMP_WORDS[1]}"
+            case $cmd in
+                create)
+                    case $prev_word in
+                        --distro)
+                            COMPREPLY=($(compgen -W "ubuntu ubuntu-lts fedora centos" -- $cur_word))
+                            ;;
+                        --cpu)
+                            COMPREPLY=($(compgen -W "1 2 4 8" -- $cur_word))
+                            ;;
+                        --mem)
+                            COMPREPLY=($(compgen -W "512 1024 2048 4096 8192" -- $cur_word))
+                            ;;
+                        --cloud-init)
+                            compopt -o default
+                            COMPREPLY=()
+                            ;;
+                        *)
+                            COMPREPLY=($(compgen -W "--name --distro --cpu --mem --cloud-init" -- $cur_word))
+                            ;;
+                    esac
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+complete -F _vm_complete vm

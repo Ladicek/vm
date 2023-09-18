@@ -1,0 +1,222 @@
+#!/bin/bash
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+    version)
+        echo -n "VirtualBox version: "
+        vboxmanage --version
+        ;;
+    create)
+        name=""
+        distro="ubuntu"
+        cpu="1"
+        mem="1024"
+        cloudinit=""
+    
+        while [[ $# -gt 0 ]] ; do
+            case "$1" in
+                --name)
+                    name="$2"
+                    shift 2
+                    ;;
+                --distro)
+                    distro="$2"
+                    shift 2
+                    ;;
+                --cpu)
+                    cpu="$2"
+                    shift 2
+                    ;;
+                --mem)
+                    mem="$2"
+                    shift 2
+                    ;;
+                --cloud-init)
+                    cloudinit="$2"
+                    shift 2
+                    ;;
+                *)
+                    echo "Ladicek's VirtualBox Tool"
+                    echo "Usage: vm create [--name <VM identifier>]"
+                    echo "                 [--distro ubuntu|ubuntu-lts|fedora|centos]"
+                    echo "                 [--cpu <number of CPUs>]"
+                    echo "                 [--mem <memory size in MB>]"
+                    echo "                 [--cloud-init <path to cloud-init user data YAML file>]"
+                    echo
+                    echo "Default values: --name vm-<distro>-<random chars>"
+                    echo "                --distro ubuntu"
+                    echo "                --cpu 1"
+                    echo "                --mem 1024"
+                    echo "                --cloud-init <none>"
+                    echo
+                    echo "Unknown option: $1"
+                    exit 1
+                    ;;
+            esac
+        done
+    
+    
+        image_url=""
+        if [[ "$distro" == "ubuntu" ]] ; then
+            image_url="https://cloud-images.ubuntu.com/releases/23.04/release/ubuntu-23.04-server-cloudimg-amd64.img"
+        elif [[ "$distro" == "ubuntu-lts" ]] ; then
+            image_url="https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+        elif [[ "$distro" == "fedora" ]] ; then
+            image_url="https://download.fedoraproject.org/pub/fedora/linux/releases/38/Cloud/x86_64/images/Fedora-Cloud-Base-38-1.6.x86_64.qcow2"
+        elif [[ "$distro" == "centos" ]] ; then
+            image_url="https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2"
+        else
+            echo "Unknown distro: $distro"
+            exit 1
+        fi
+        image_path="$HOME/.vm/$distro-$(echo -n $image_url | sha256sum | cut -d ' ' -f 1)"
+    
+        if [[ ! "$cpu" =~ ^[0-9]+$ ]] ; then
+            echo "Bad number of CPUs: $cpu"
+            exit 1
+        fi
+        if [[ ! "$mem" =~ ^[0-9]+$ ]] ; then
+            echo "Bad memory size: $mem"
+            exit 1
+        fi
+        if [[ ! -z "$cloudinit" && ! -f "$cloudinit" ]] ; then
+            echo "Not found cloud-init file: $cloudinit"
+            exit 1
+        fi
+    
+        vm_name="$name"
+        if [[ -z "$name" ]] ; then
+            vm_name="vm-$distro-$(pwgen -A 10)"
+        fi
+    
+        if [[ ! -f "$image_path.raw" ]] ; then
+            echo "Downloading '$distro' image into $image_path"
+            curl --output $image_path.qcow2 --create-dirs --progress-bar $image_url
+            qemu-img convert -O raw "$image_path.qcow2" "$image_path.raw"
+            rm -f "$image_path.qcow2"
+        fi
+    
+        vm_dir="$HOME/.vm/$vm_name"
+        if [[ -d "$vm_dir" ]] ; then
+            echo "VM '$vm_name' already exists in $vm_dir"
+            exit 1
+        fi
+        mkdir -p "$vm_dir"
+    
+        vm_disk="$vm_dir/disk.vdi"
+        vboxmanage convertfromraw "$image_path.raw" "$vm_disk"
+    
+        if [[ -f "$cloudinit" ]] ; then
+            cp "$cloudinit" "$vm_dir/user-data"
+        else
+            touch "$vm_dir/user-data"
+        fi
+
+        github_user=""
+        if [[ -f "$HOME/.vm/config.json" ]] ; then
+            github_user=$(jq --raw-output 'if ."github-user" == null then "" else ."github-user" end' "$HOME/.vm/config.json")
+        fi
+        if [[ -z "$github_user" ]] ; then
+            cat > "$vm_dir/vendor-data" <<EOF
+#cloud-config
+ssh_pwauth: true
+chpasswd:
+  expire: false
+users:
+- name: user
+  plain_text_passwd: user
+  lock_passwd: false
+  sudo: ALL=(ALL) NOPASSWD:ALL
+  shell: /bin/bash
+EOF
+        else
+            cat > "$vm_dir/vendor-data" <<EOF
+#cloud-config
+ssh_pwauth: true
+chpasswd:
+  expire: false
+users:
+- name: user
+  plain_text_passwd: user
+  lock_passwd: false
+  sudo: ALL=(ALL) NOPASSWD:ALL
+  ssh_import_id:
+  - gh:$github_user
+  shell: /bin/bash
+EOF
+        fi
+
+        cat > "$vm_dir/meta-data" <<EOF
+instance-id: $vm_name
+local-hostname: $vm_name
+EOF
+
+        seed_disk="$vm_dir/seed.iso"
+        genisoimage -output "$seed_disk" -volid cidata -joliet -rock "$vm_dir/user-data" "$vm_dir/meta-data" "$vm_dir/vendor-data"
+    
+        nic_name=$(ip -o addr show | grep -v -e lo -e docker -e tun -e vboxnet | head -n 1 | cut -d ' ' -f 2)
+    
+        echo "Creating VM '$vm_name' with $cpu CPU(s) and $mem MB of RAM bridged to network interface $nic_name"
+        vboxmanage createvm --name "$vm_name" --ostype Linux_64 --register
+        vboxmanage modifyvm "$vm_name" --cpus "$cpu" --memory "$mem" --graphicscontroller=vmsvga --vram=32 \
+            --boot1 disk --acpi on --nic1 bridged --bridgeadapter1 "$nic_name"
+        vboxmanage storagectl "$vm_name" --name IDE --add ide
+        vboxmanage storageattach "$vm_name" --storagectl IDE --port 0 --device 0 --type hdd --medium "$vm_disk"
+        vboxmanage storageattach "$vm_name" --storagectl IDE --port 1 --device 0 --type dvddrive --medium "$seed_disk"
+        vboxmanage modifyvm "$vm_name" --uart1 0x3F8 4 --uartmode1 file "$vm_dir/serial.txt"
+    
+        echo "Done"
+        ;;
+    start)
+        vboxmanage startvm $1 --type headless
+        vm_dir="$HOME/.vm/$1"
+        if [[ -f "$vm_dir/serial.txt" ]] ; then
+            tail -f "$vm_dir/serial.txt" | sed '/modules:final/ q'
+            grep ci-info "$vm_dir/serial.txt" | sed -e 's|.*ci-info: ||'
+            mac_addr=$(vboxmanage showvminfo $1 --machinereadable | grep macaddress | head -n 1 | cut -d '"' -f 2)
+            ip_addr=$(grep ci-info "$vm_dir/serial.txt" | sed -e 's|.*ci-info: ||' -e 's|:||g' | grep -i $mac_addr | head -n 1 | cut -d '|' -f 4 | sed -e 's| ||g')
+            echo "VM '$1' started, IP address: $ip_addr"
+        fi
+        ;;
+    stop)
+        vboxmanage controlvm $1 acpipowerbutton
+        ;;
+    kill)
+        vboxmanage controlvm $1 poweroff
+        ;;
+    destroy)
+        vboxmanage unregistervm $1 --delete
+        rm -rf "$HOME/.vm/$1"
+        ;;
+    list)
+        if [[ "$1" == "--running" ]] ; then
+            vboxmanage list runningvms
+        else
+            vboxmanage list vms
+        fi
+        ;;
+    info)
+        vboxmanage showvminfo $1
+        ;;
+    ssh)
+        vm_dir="$HOME/.vm/$1"
+        if [[ -f "$vm_dir/serial.txt" ]] ; then
+            mac_addr=$(vboxmanage showvminfo $1 --machinereadable | grep macaddress | head -n 1 | cut -d '"' -f 2)
+            ip_addr=$(grep ci-info "$vm_dir/serial.txt" | sed -e 's|.*ci-info: ||' -e 's|:||g' | grep -i $mac_addr | head -n 1 | cut -d '|' -f 4 | sed -e 's| ||g')
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null user@${ip_addr}
+        else
+            echo "Serial console not found in $vm_dir/serial.txt"
+        fi
+        # for historical reference:
+        # ssh user@$(vboxmanage guestproperty get $1 "/VirtualBox/GuestInfo/Net/0/V4/IP" | awk '{ print $2 }')
+        ;;
+    *)
+        echo "Ladicek's VirtualBox Tool"
+        echo "Usage: vm <command> [<VM identifier>]"
+        echo
+        echo "Commands: version, create, start, stop, kill, destroy, list, info, ssh"
+        exit 1
+        ;;
+esac
